@@ -7,12 +7,13 @@ from telebot import TeleBot, types
 from datetime import datetime, timedelta
 import json
 import re
+import time
 
 load_dotenv()
 
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 # This is a specific channel ID. Ensure the bot has necessary permissions in this channel.
-CHANNEL_ID = -1002510470267
+CHANNEL_ID = -1002510470267 # Example channel ID, replace with your actual channel ID if needed
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 bot = TeleBot(TOKEN)
@@ -20,6 +21,13 @@ logging.basicConfig(level=logging.INFO)
 
 # Dictionary to store temporary user data for multi-step conversations
 user_states = {}
+
+# List of allowed admin chat IDs (IMPORTANT: replace with actual admin IDs in production)
+ALLOWED_ADMINS = [int(admin_id) for admin_id in os.getenv('TELEGRAM_ADMIN_IDS', '').split(',') if admin_id.strip()]
+if not ALLOWED_ADMINS:
+    logging.warning("No admin IDs specified in TELEGRAM_ADMIN_IDS environment variable. Admin panel might be inaccessible or insecure.")
+    # Fallback for local testing if no env var is set, but should be removed in production
+    # ALLOWED_ADMINS = [YOUR_TEST_ADMIN_CHAT_ID] # Uncomment and set your chat ID for local testing without env var
 
 # Expanded list of Ukrainian cities, including many towns from Kyiv Oblast with their associated hashtags
 UKRAINIAN_CITIES = {
@@ -41,7 +49,7 @@ UKRAINIAN_CITIES = {
     'буча': '#Буча',
     'фастів': '#Фастів',
     'обухів': '#Обухів',
-    'вишневе': '#Вишневе', # Highlighted as requested
+    'вишневе': '#Вишневе',
     'переяслав': '#Переяслав',
     'васильків': '#Васильків',
     'вишгород': '#Вишгород',
@@ -101,7 +109,7 @@ def init_db():
                 );
             """)
 
-            # Tables for managing target channels and groups
+            # Tables for managing target channels and groups (for general usage, e.g., finding relevant ones)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS target_channels (
                     id SERIAL PRIMARY KEY,
@@ -128,6 +136,33 @@ def init_db():
                     is_active BOOLEAN DEFAULT TRUE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (added_by) REFERENCES users(chat_id)
+                );
+            """)
+
+            # NEW: Table for storing specific channels/groups where bot will post comments/invites
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_target_locations (
+                    id SERIAL PRIMARY KEY,
+                    location_name VARCHAR(255) NOT NULL,
+                    location_id BIGINT UNIQUE NOT NULL, -- Telegram chat_id of the channel/group
+                    location_type VARCHAR(10) NOT NULL, -- 'channel' or 'group'
+                    comment_message_id INTEGER, -- Foreign key to specific_messages (optional)
+                    invite_link TEXT, -- Persistent invite link for the location
+                    is_active BOOLEAN DEFAULT TRUE,
+                    added_by BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # NEW: Table for storing specific messages/comments the bot will use
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_comment_templates (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(100) UNIQUE NOT NULL,
+                    message_text TEXT NOT NULL,
+                    subscription_link TEXT,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
 
@@ -268,7 +303,10 @@ def get_admin_menu():
     )
     keyboard.add(
         types.InlineKeyboardButton("📈 Рейтинги", callback_data="admin_ratings"),
-        types.InlineKeyboardButton("🔧 Налаштування", callback_data="admin_settings")
+        types.InlineKeyboardButton("⚙️ Бот активність", callback_data="admin_bot_activity") # NEW
+    )
+    keyboard.add(
+        types.InlineKeyboardButton("🔙 Головне меню", callback_data="main_menu")
     )
     return keyboard
 
@@ -318,6 +356,41 @@ def get_user_settings_menu(notifications_enabled):
     keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="main_menu"))
     return keyboard
 
+# NEW: Bot activity management keyboards
+def get_admin_bot_activity_menu():
+    """Returns the admin menu for bot activity (commenting/inviting)."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton("➕ Додати цільове місце", callback_data="admin_add_bot_target_location_start"),
+        types.InlineKeyboardButton("📄 Мої цільові місця", callback_data="admin_list_bot_target_locations"),
+        types.InlineKeyboardButton("➕ Створити повідомлення", callback_data="admin_create_comment_template_start"),
+        types.InlineKeyboardButton("✉️ Мої повідомлення", callback_data="admin_list_comment_templates"),
+        types.InlineKeyboardButton("🚀 Запустити активність", callback_data="admin_run_bot_activity_start"),
+        types.InlineKeyboardButton("📈 Статистика активності", callback_data="admin_bot_activity_stats"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_menu")
+    )
+    return keyboard
+
+def get_bot_target_location_manage_keyboard(location_id):
+    """Keyboard to manage a specific bot target location."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("✏️ Редагувати", callback_data=f"admin_edit_bot_target_location_{location_id}"),
+        types.InlineKeyboardButton("🗑️ Видалити", callback_data=f"admin_delete_bot_target_location_confirm_{location_id}")
+    )
+    keyboard.add(types.InlineKeyboardButton("🔙 До списку", callback_data="admin_list_bot_target_locations"))
+    return keyboard
+
+def get_bot_comment_template_manage_keyboard(template_id):
+    """Keyboard to manage a specific bot comment template."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("✏️ Редагувати", callback_data=f"admin_edit_comment_template_{template_id}"),
+        types.InlineKeyboardButton("🗑️ Видалити", callback_data=f"admin_delete_comment_template_confirm_{template_id}")
+    )
+    keyboard.add(types.InlineKeyboardButton("🔙 До списку", callback_data="admin_list_comment_templates"))
+    return keyboard
+
 # ============ MAIN COMMANDS ============
 
 @bot.message_handler(commands=['start'])
@@ -338,10 +411,6 @@ def start_message(message):
 def admin_panel(message):
     """Handles the /admin command, showing the admin panel if the user is authorized."""
     admin_chat_id = message.chat.id
-    # IMPORTANT: Replace with actual admin chat_ids for security
-    # For testing, allows the sender to be admin. In production, hardcode admin IDs.
-    ALLOWED_ADMINS = [admin_chat_id] # Replace with [123456789, 987654321] for production
-
     if admin_chat_id not in ALLOWED_ADMINS:
         bot.send_message(admin_chat_id, "❌ У вас немає прав доступу до адмін-панелі.")
         return
@@ -407,16 +476,13 @@ def callback_handler(call):
             toggle_notifications(call)
 
         elif call.data == "channels_by_city":
-            # This is a placeholder as discussed, the admin has the full stats
             bot.send_message(chat_id, "Функція 'Канали за містами' ще не реалізована для звичайних користувачів, але ви можете переглянути свої додані канали та групи.")
 
         elif call.data == "channels_stats":
-            # This points to the admin function, but users won't have the context
             bot.send_message(chat_id, "Функція 'Статистика каналів' доступна тільки адміністраторам.")
-            # For a regular user, you might want to show their own stats or a general overview
 
         elif call.data == "stats":
-            show_overall_stats(call) # Now actually shows overall stats
+            show_overall_stats(call)
 
         elif call.data == "help":
             bot.send_message(chat_id, "Допомога ще не реалізована. Зверніться до адміністратора.")
@@ -428,8 +494,6 @@ def callback_handler(call):
 
     except Exception as e:
         logging.error(f"Помилка в callback_handler: {e}")
-        # Only answer if it wasn't already answered. This catch is for deeper errors.
-        # It's okay to send a message here as the callback_query was already answered.
         bot.send_message(chat_id, "Сталася помилка під час обробки вашого запиту. Спробуйте ще раз або зверніться до адміністратора.")
 
 
@@ -527,6 +591,10 @@ def handle_user_input(message):
     # Admin broadcast input handler
     if input_type.startswith('admin_broadcast_'):
         handle_admin_broadcast_input(message, user_input, input_type)
+        return
+    # NEW: Admin bot activity input handler
+    elif input_type.startswith('admin_bot_target_location_') or input_type.startswith('admin_comment_template_'):
+        handle_admin_bot_activity_input(message, user_input, input_type)
         return
 
     if input_type == 'channel_name':
@@ -730,7 +798,7 @@ def send_broadcast_by_city(message_text, target_cities=None, template_id=None, i
                 with conn.cursor() as cur:
                     if target_cities:
                         # Ensure target_cities is a tuple or list for IN clause
-                        target_cities_tuple = tuple(c.strip().lower() for c in target_cities.split(',') if c.strip())
+                        target_cities_tuple = tuple(c.strip().lower() for c in target_cities if c.strip())
                         if target_cities_tuple:
                             placeholders = ','.join(['%s'] * len(target_cities_tuple))
                             cur.execute(f"""
@@ -794,7 +862,7 @@ def get_user_city(chat_id):
     finally:
         if conn:
             conn.close()
-    return result['city'] if result else 'київ'
+    return result['city'] if result and result['city'] else 'київ' # Default to 'київ' if city is None
 
 def get_user_notifications_status(chat_id):
     """Retrieves the notification status for a user."""
@@ -980,14 +1048,9 @@ def delete_broadcast_template_db(template_id):
             with conn.cursor() as cur:
                 # Delete associated ratings first due to foreign key constraint
                 cur.execute("DELETE FROM broadcast_ratings WHERE template_id = %s;", (template_id,))
-                conn.commit() # Commit ratings deletion
                 cur.execute("DELETE FROM broadcast_templates WHERE id = %s;", (template_id,))
-                conn.commit() # Commit template deletion
                 return cur.rowcount > 0
     except Exception as e:
-        # Rollback in case of error
-        if conn:
-            conn.rollback()
         logging.error(f"Error deleting broadcast template {template_id}: {e}")
         return False
     finally:
@@ -1013,6 +1076,12 @@ def send_invite_link(chat_id):
 def handle_admin_actions(call):
     """Routes admin actions based on callback data."""
     chat_id = call.message.chat.id
+
+    # Check if the user is an authorized admin
+    if chat_id not in ALLOWED_ADMINS:
+        bot.send_message(chat_id, "❌ У вас немає прав доступу до цієї функції.")
+        return
+
     action = call.data.replace("admin_", "")
 
     if action == "broadcast":
@@ -1047,6 +1116,37 @@ def handle_admin_actions(call):
         show_ratings_stats(call)
     elif action == "cities":
         show_city_hashtags(call)
+    # NEW Admin Bot Activity actions
+    elif action == "bot_activity":
+        handle_admin_bot_activity_menu(call)
+    elif action == "add_bot_target_location_start":
+        admin_add_bot_target_location_start(call)
+    elif action == "list_bot_target_locations":
+        admin_list_bot_target_locations(call)
+    elif action.startswith("edit_bot_target_location_"):
+        location_id = int(action.split('_')[4])
+        admin_edit_bot_target_location_start(call, location_id)
+    elif action.startswith("delete_bot_target_location_confirm_"):
+        location_id = int(action.split('_')[4])
+        admin_delete_bot_target_location(call, location_id)
+    elif action == "create_comment_template_start":
+        admin_create_comment_template_start(call)
+    elif action == "list_comment_templates":
+        admin_list_comment_templates(call)
+    elif action.startswith("edit_comment_template_"):
+        template_id = int(action.split('_')[3])
+        admin_edit_comment_template_start(call, template_id)
+    elif action.startswith("delete_comment_template_confirm_"):
+        template_id = int(action.split('_')[3])
+        admin_delete_comment_template(call, template_id)
+    elif action == "run_bot_activity_start":
+        admin_run_bot_activity_select_target(call)
+    elif action.startswith("run_bot_activity_execute_"):
+        location_id = int(action.split('_')[4])
+        template_id = int(action.split('_')[5])
+        admin_execute_bot_activity(call, location_id, template_id)
+    elif action == "bot_activity_stats":
+        show_bot_activity_stats(call)
     elif action == "settings":
         bot.send_message(chat_id, "Налаштування адмін-панелі ще не реалізовані.")
     elif action == "menu":
@@ -1178,7 +1278,7 @@ def admin_execute_send_broadcast(call):
     target_cities = template['target_cities']
     if target_cities:
         # Convert comma-separated string to a list of cities
-        target_cities_list = [city.strip().lower() for city in target_cities.split(',') if c.strip()]
+        target_cities_list = [city.strip().lower() for city in target_cities.split(',') if city.strip()]
     else:
         target_cities_list = None # Send to all if no cities specified
 
@@ -1671,6 +1771,592 @@ def toggle_notifications(call):
 
     user_settings(call) # Refresh settings menu
 
+# ============ NEW BOT ACTIVITY FUNCTIONS (ADMIN ONLY) ============
+
+def handle_admin_bot_activity_menu(call):
+    """Admin menu for bot commenting/inviting activity."""
+    bot.edit_message_text(
+        "⚙️ Меню управління активністю бота (коментування/запрошення):",
+        call.message.chat.id, call.message.message_id,
+        reply_markup=get_admin_bot_activity_menu()
+    )
+
+# --- Bot Target Locations ---
+
+def admin_add_bot_target_location_start(call):
+    """Starts adding a new bot target location."""
+    chat_id = call.message.chat.id
+    user_states[chat_id] = {'waiting_for': 'admin_bot_target_location_name'}
+    bot.edit_message_text(
+        "➕ Додавання нового цільового місця для бота.\n\n"
+        "Введіть *назву* каналу/групи (для ідентифікації, наприклад, 'Група Київ Продаж'):",
+        chat_id, call.message.message_id, parse_mode='Markdown'
+    )
+
+def admin_list_bot_target_locations(call):
+    """Displays a list of all bot target locations."""
+    chat_id = call.message.chat.id
+    locations = get_bot_target_locations()
+    if not locations:
+        bot.edit_message_text("📄 Немає доданих цільових місць для бота.", chat_id, call.message.message_id, reply_markup=get_admin_bot_activity_menu())
+        return
+
+    message_text = "📄 Цільові місця для активності бота:\n\n"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for loc in locations:
+        message_text += f"ID: `{loc['id']}`\n" \
+                        f"Назва: *{loc['location_name']}*\n" \
+                        f"ID чату: `{loc['location_id']}`\n" \
+                        f"Тип: {loc['location_type'].capitalize()}\n" \
+                        f"Посилання: {loc['invite_link'] if loc['invite_link'] else 'Немає'}\n\n"
+        keyboard.add(types.InlineKeyboardButton(f"⚙️ Керувати: {loc['location_name']}", callback_data=f"admin_edit_bot_target_location_{loc['id']}"))
+
+    keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_bot_activity"))
+    bot.edit_message_text(message_text, chat_id, call.message.message_id,
+                          reply_markup=keyboard, parse_mode='Markdown', disable_web_page_preview=True)
+
+def admin_edit_bot_target_location_start(call, location_id):
+    """Starts editing an existing bot target location."""
+    chat_id = call.message.chat.id
+    location = get_bot_target_location(location_id)
+    if not location:
+        bot.send_message(chat_id, "Цільове місце не знайдено.")
+        admin_list_bot_target_locations(call)
+        return
+
+    user_states[chat_id] = {
+        'waiting_for': 'admin_bot_target_location_edit_name',
+        'location_id': location_id,
+        'original_data': location.copy()
+    }
+    bot.edit_message_text(
+        f"✏️ Редагування цільового місця *{location['location_name']}* (ID: `{location_id}`).\n\n"
+        f"Введіть нову *назву* (поточна: '{location['location_name']}'):",
+        chat_id, call.message.message_id, parse_mode='Markdown'
+    )
+
+def admin_delete_bot_target_location(call, location_id):
+    """Deletes a bot target location after confirmation."""
+    chat_id = call.message.chat.id
+    location = get_bot_target_location(location_id)
+    if not location:
+        bot.send_message(chat_id, "Цільове місце не знайдено.")
+        admin_list_bot_target_locations(call)
+        return
+
+    success = delete_bot_target_location_db(location_id)
+    if success:
+        bot.edit_message_text(f"✅ Цільове місце '{location['location_name']}' (ID: `{location_id}`) успішно видалено.", chat_id, call.message.message_id, parse_mode='Markdown', reply_markup=get_admin_bot_activity_menu())
+    else:
+        bot.edit_message_text(f"❌ Помилка при видаленні цільового місця '{location['location_name']}' (ID: `{location_id}`).", chat_id, call.message.message_id, parse_mode='Markdown', reply_markup=get_admin_bot_activity_menu())
+
+# --- Comment Templates ---
+
+def admin_create_comment_template_start(call):
+    """Starts creating a new bot comment template."""
+    chat_id = call.message.chat.id
+    user_states[chat_id] = {'waiting_for': 'admin_comment_template_create_name'}
+    bot.edit_message_text(
+        "➕ Створення нового повідомлення для коментування.\n\n"
+        "Введіть унікальну *назву* для шаблону (для внутрішнього використання, наприклад, 'Запрошення_Канал1'):",
+        chat_id, call.message.message_id, parse_mode='Markdown'
+    )
+
+def admin_list_comment_templates(call):
+    """Displays a list of all bot comment templates."""
+    chat_id = call.message.chat.id
+    templates = get_bot_comment_templates()
+    if not templates:
+        bot.edit_message_text("📄 Немає збережених повідомлень для коментування.", chat_id, call.message.message_id, reply_markup=get_admin_bot_activity_menu())
+        return
+
+    message_text = "📄 Ваші повідомлення для коментування:\n\n"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for tpl in templates:
+        message_text += f"ID: `{tpl['id']}`\n" \
+                        f"Назва: *{tpl['name']}*\n" \
+                        f"Текст:\n_{tpl['message_text'][:100]}..._\n" \
+                        f"Посилання: {tpl['subscription_link'] if tpl['subscription_link'] else 'Немає'}\n\n"
+        keyboard.add(types.InlineKeyboardButton(f"⚙️ Керувати: {tpl['name']}", callback_data=f"admin_edit_comment_template_{tpl['id']}"))
+
+    keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_bot_activity"))
+    bot.edit_message_text(message_text, chat_id, call.message.message_id,
+                          reply_markup=keyboard, parse_mode='Markdown', disable_web_page_preview=True)
+
+def admin_edit_comment_template_start(call, template_id):
+    """Starts editing an existing bot comment template."""
+    chat_id = call.message.chat.id
+    template = get_bot_comment_template(template_id)
+    if not template:
+        bot.send_message(chat_id, "Повідомлення не знайдено.")
+        admin_list_comment_templates(call)
+        return
+
+    user_states[chat_id] = {
+        'waiting_for': 'admin_comment_template_edit_name',
+        'template_id': template_id,
+        'original_data': template.copy()
+    }
+    bot.edit_message_text(
+        f"✏️ Редагування повідомлення *{template['name']}* (ID: `{template_id}`).\n\n"
+        f"Введіть нову *назву* (поточна: '{template['name']}'):",
+        chat_id, call.message.message_id, parse_mode='Markdown'
+    )
+
+def admin_delete_comment_template(call, template_id):
+    """Deletes a bot comment template after confirmation."""
+    chat_id = call.message.chat.id
+    template = get_bot_comment_template(template_id)
+    if not template:
+        bot.send_message(chat_id, "Повідомлення не знайдено.")
+        admin_list_comment_templates(call)
+        return
+
+    success = delete_bot_comment_template_db(template_id)
+    if success:
+        bot.edit_message_text(f"✅ Повідомлення '{template['name']}' (ID: `{template_id}`) успішно видалено.", chat_id, call.message.message_id, parse_mode='Markdown', reply_markup=get_admin_bot_activity_menu())
+    else:
+        bot.edit_message_text(f"❌ Помилка при видаленні повідомлення '{template['name']}' (ID: `{template_id}`).", chat_id, call.message.message_id, parse_mode='Markdown', reply_markup=get_admin_bot_activity_menu())
+
+
+# --- Bot Activity Execution ---
+
+def admin_run_bot_activity_select_target(call):
+    """Admin selects a target location and a message template to run bot activity."""
+    chat_id = call.message.chat.id
+    locations = get_bot_target_locations()
+    templates = get_bot_comment_templates()
+
+    if not locations or not templates:
+        msg = "Для запуску активності потрібно:\n"
+        if not locations: msg += "  - Додати хоча б одне цільове місце (канал/групу).\n"
+        if not templates: msg += "  - Створити хоча б одне повідомлення для коментування.\n"
+        bot.edit_message_text(msg, chat_id, call.message.message_id, reply_markup=get_admin_bot_activity_menu())
+        return
+
+    message_text = "🚀 Оберіть цільове місце та повідомлення для активності бота:\n\n"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    for loc in locations:
+        for tpl in templates:
+            button_text = f"👉 {loc['location_name']} ({loc['location_type'].capitalize()}) з повідомленням '{tpl['name']}'"
+            callback_data = f"admin_run_bot_activity_execute_{loc['id']}_{tpl['id']}"
+            keyboard.add(types.InlineKeyboardButton(button_text, callback_data=callback_data))
+    
+    keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_bot_activity"))
+    bot.edit_message_text(message_text, chat_id, call.message.message_id, reply_markup=keyboard)
+
+
+def admin_execute_bot_activity(call, location_id, template_id):
+    """Executes the bot activity (commenting/inviting) in the selected location with the selected message."""
+    chat_id = call.message.chat.id
+    
+    location = get_bot_target_location(location_id)
+    template = get_bot_comment_template(template_id)
+
+    if not location or not template:
+        bot.send_message(chat_id, "Цільове місце або повідомлення не знайдено.")
+        admin_run_bot_activity_select_target(call)
+        return
+
+    bot.edit_message_text(
+        f"🚀 Запускаю активність в *{location['location_name']}* з повідомленням *'{template['name']}'*...\n\n"
+        f"Тип: {location['location_type'].capitalize()}\n"
+        f"Текст повідомлення:\n_{template['message_text'][:100]}..._\n"
+        f"Посилання для підписки: {template['subscription_link'] or 'Немає'}",
+        chat_id, call.message.message_id, parse_mode='Markdown'
+    )
+
+    full_message = f"{template['message_text']}\n\n{template['subscription_link']}" if template['subscription_link'] else template['message_text']
+
+    try:
+        # Simulate sending a message to the target channel/group
+        # In a real scenario, this would use bot.send_message(chat_id=location['location_id'], text=full_message)
+        # or bot.send_message(chat_id=location['location_id'], text=full_message, reply_to_message_id=...) for comments
+        # For inviting, it's more complex (e.g., bot.add_chat_members or using invite links)
+
+        # For demonstration, we'll just log and confirm
+        logging.info(f"Спроба відправки повідомлення у {location['location_name']} ({location['location_id']}): '{full_message}'")
+        
+        # This is a placeholder for actual Telegram API calls.
+        # You need to ensure your bot has the necessary permissions (admin, can post messages, etc.)
+        # If it's a channel, the bot sends a message. If it's a group, the bot sends a message.
+        # For "inviting people", direct adding is problematic. It's usually about sharing invite link.
+
+        # Example for sending message:
+        bot.send_message(location['location_id'], full_message, disable_web_page_preview=True)
+        # If posting a comment to a channel, it usually involves replying to a channel post.
+        # This requires getting the message ID of the channel post.
+        # bot.send_message(chat_id=channel_id, text=comment_text, reply_to_message_id=channel_post_id)
+
+        # Update bot_target_locations with the last comment message ID if applicable
+        # (This is more complex and depends on whether you're posting a new message or replying)
+        
+        bot.send_message(chat_id, f"✅ Активність успішно запущено у *{location['location_name']}*! Повідомлення відправлено.", parse_mode='Markdown', reply_markup=get_admin_bot_activity_menu())
+
+    except Exception as e:
+        logging.error(f"Помилка при запуску активності в {location['location_name']}: {e}")
+        bot.send_message(chat_id, f"❌ Помилка при запуску активності у *{location['location_name']}*: {e}. Переконайтеся, що бот є адміністратором у цій групі/каналі та має необхідні дозволи.", parse_mode='Markdown', reply_markup=get_admin_bot_activity_menu())
+    
+# --- Statistics ---
+def show_bot_activity_stats(call):
+    """Displays statistics related to bot's commenting/inviting activity."""
+    conn = get_db_connection()
+    location_stats = []
+    template_stats = []
+    
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Stats for target locations
+                cur.execute("""
+                    SELECT
+                        location_name,
+                        location_type,
+                        COUNT(*) as total_entries
+                    FROM bot_target_locations
+                    GROUP BY location_name, location_type
+                    ORDER BY total_entries DESC;
+                """)
+                location_stats = cur.fetchall()
+
+                # Stats for comment templates
+                cur.execute("""
+                    SELECT
+                        name,
+                        COUNT(*) as total_uses -- Placeholder, needs actual logging of sends
+                    FROM bot_comment_templates
+                    GROUP BY name
+                    ORDER BY name;
+                """)
+                template_stats = cur.fetchall()
+
+    except Exception as e:
+        logging.error(f"Error fetching bot activity stats: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    stats_text = "📈 Статистика активності бота:\n\n"
+
+    stats_text += "📍 Цільові місця:\n"
+    if location_stats:
+        for stat in location_stats:
+            stats_text += f"  *{stat['location_name']}* ({stat['location_type'].capitalize()}): {stat['total_entries']} запис(ів)\n"
+    else:
+        stats_text += "  Немає доданих цільових місць.\n"
+    
+    stats_text += "\n✉️ Шаблони повідомлень:\n"
+    if template_stats:
+        for stat in template_stats:
+            stats_text += f"  *{stat['name']}*: {stat['total_uses']} використання(ь) (потрібно додати логування)\n"
+    else:
+        stats_text += "  Немає створених шаблонів повідомлень.\n"
+
+    stats_text += "\n*Примітка*: Детальна статистика використання (скільки разів відправлено повідомлення, успішність) вимагає додаткового логування."
+
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_bot_activity"))
+
+    bot.edit_message_text(
+        stats_text,
+        call.message.chat.id, call.message.message_id,
+        reply_markup=keyboard, parse_mode='Markdown'
+    )
+
+
+def handle_admin_bot_activity_input(message, user_input, input_type):
+    """Handles multi-step input for admin bot activity creation/editing."""
+    chat_id = message.chat.id
+    state = user_states.get(chat_id)
+
+    if not state:
+        bot.send_message(chat_id, "Неочікуване введення. Будь ласка, почніть знову з адмін-панелі.", reply_markup=get_admin_menu())
+        if chat_id in user_states:
+            del user_states[chat_id]
+        return
+
+    # --- Bot Target Location Input ---
+    if input_type == 'admin_bot_target_location_name' or input_type == 'admin_bot_target_location_edit_name':
+        state['current_data'] = state.get('current_data', {})
+        state['current_data']['location_name'] = user_input
+        state['waiting_for'] = 'admin_bot_target_location_id' if 'location_id' not in state else 'admin_bot_target_location_edit_id'
+        
+        prompt_text = "Введіть *ID чату* (каналу/групи). Це *числове ID*, яке можна отримати, наприклад, через @getidsbot. " \
+                      "Для каналів це зазвичай від'ємне число (наприклад, -1001234567890).\n"
+        if 'original_data' in state and state['original_data'].get('location_id'):
+            prompt_text += f"(Поточний ID: `{state['original_data']['location_id']}`)"
+        bot.send_message(chat_id, prompt_text, parse_mode='Markdown')
+
+    elif input_type == 'admin_bot_target_location_id' or input_type == 'admin_bot_target_location_edit_id':
+        try:
+            location_id = int(user_input)
+            state['current_data']['location_id'] = location_id
+            state['waiting_for'] = 'admin_bot_target_location_type' if 'location_id' not in state else 'admin_bot_target_location_edit_type'
+
+            prompt_text = "Введіть *тип місця* ('channel' для каналу або 'group' для групи):\n"
+            if 'original_data' in state and state['original_data'].get('location_type'):
+                prompt_text += f"(Поточний тип: '{state['original_data']['location_type']}')"
+            bot.send_message(chat_id, prompt_text, parse_mode='Markdown')
+        except ValueError:
+            bot.send_message(chat_id, "❌ Некоректний ID чату. Будь ласка, введіть числове ID.")
+
+    elif input_type == 'admin_bot_target_location_type' or input_type == 'admin_bot_target_location_edit_type':
+        location_type = user_input.lower()
+        if location_type not in ['channel', 'group']:
+            bot.send_message(chat_id, "❌ Некоректний тип. Введіть 'channel' або 'group'.")
+            return
+        state['current_data']['location_type'] = location_type
+        state['waiting_for'] = 'admin_bot_target_location_invite_link' if 'location_id' not in state else 'admin_bot_target_location_edit_invite_link'
+
+        prompt_text = "Введіть *посилання-запрошення* (необов'язково, для груп/каналів). Залиште порожнім, якщо немає або не потрібно.\n"
+        if 'original_data' in state and state['original_data'].get('invite_link'):
+            prompt_text += f"(Поточне посилання: `{state['original_data']['invite_link']}`)"
+        bot.send_message(chat_id, prompt_text, parse_mode='Markdown', disable_web_page_preview=True)
+
+    elif input_type == 'admin_bot_target_location_invite_link' or input_type == 'admin_bot_target_location_edit_invite_link':
+        state['current_data']['invite_link'] = user_input if user_input else None # Store None if empty
+
+        name = state['current_data'].get('location_name')
+        location_id = state['current_data'].get('location_id')
+        location_type = state['current_data'].get('location_type')
+        invite_link = state['current_data'].get('invite_link')
+        
+        db_location_id = state.get('location_id') # This is the ID in our DB for editing
+
+        if db_location_id is None: # Create new
+            success = add_bot_target_location(name, location_id, location_type, invite_link, chat_id)
+            if success:
+                bot.send_message(chat_id, "✅ Цільове місце успішно додано!", reply_markup=get_admin_bot_activity_menu())
+            else:
+                bot.send_message(chat_id, "❌ Помилка при додаванні цільового місця. Можливо, такий Chat ID вже існує.", reply_markup=get_admin_bot_activity_menu())
+        else: # Edit existing
+            success = update_bot_target_location(db_location_id, name, location_id, location_type, invite_link)
+            if success:
+                bot.send_message(chat_id, "✅ Цільове місце успішно оновлено!", reply_markup=get_admin_bot_activity_menu())
+            else:
+                bot.send_message(chat_id, "❌ Помилка при оновленні цільового місця.", reply_markup=get_admin_bot_activity_menu())
+        
+        del user_states[chat_id]
+
+    # --- Comment Template Input ---
+    elif input_type == 'admin_comment_template_create_name' or input_type == 'admin_comment_template_edit_name':
+        state['current_data'] = state.get('current_data', {})
+        state['current_data']['name'] = user_input
+        state['waiting_for'] = 'admin_comment_template_message_text' if 'template_id' not in state else 'admin_comment_template_edit_message_text'
+        
+        prompt_text = "Введіть *текст повідомлення* для коментування:\n"
+        if 'original_data' in state and state['original_data'].get('message_text'):
+            prompt_text += f"(Поточний текст: '{state['original_data']['message_text']}')"
+        bot.send_message(chat_id, prompt_text, parse_mode='Markdown')
+
+    elif input_type == 'admin_comment_template_message_text' or input_type == 'admin_comment_template_edit_message_text':
+        state['current_data']['message_text'] = user_input
+        state['waiting_for'] = 'admin_comment_template_subscription_link' if 'template_id' not in state else 'admin_comment_template_edit_subscription_link'
+
+        prompt_text = "Введіть *посилання для підписки* (URL). Залиште порожнім, якщо не потрібно.\n"
+        if 'original_data' in state and state['original_data'].get('subscription_link'):
+            prompt_text += f"(Поточне посилання: `{state['original_data']['subscription_link']}`)"
+        bot.send_message(chat_id, prompt_text, parse_mode='Markdown', disable_web_page_preview=True)
+
+    elif input_type == 'admin_comment_template_subscription_link' or input_type == 'admin_comment_template_edit_subscription_link':
+        state['current_data']['subscription_link'] = user_input if user_input else None
+
+        name = state['current_data'].get('name')
+        message_text = state['current_data'].get('message_text')
+        subscription_link = state['current_data'].get('subscription_link')
+
+        template_id = state.get('template_id') # This is the ID in our DB for editing
+
+        if template_id is None: # Create new
+            success = add_bot_comment_template(name, message_text, subscription_link)
+            if success:
+                bot.send_message(chat_id, "✅ Повідомлення для коментування успішно створено!", reply_markup=get_admin_bot_activity_menu())
+            else:
+                bot.send_message(chat_id, "❌ Помилка при створенні повідомлення. Можливо, назва вже існує.", reply_markup=get_admin_bot_activity_menu())
+        else: # Edit existing
+            success = update_bot_comment_template(template_id, name, message_text, subscription_link)
+            if success:
+                bot.send_message(chat_id, "✅ Повідомлення для коментування успішно оновлено!", reply_markup=get_admin_bot_activity_menu())
+            else:
+                bot.send_message(chat_id, "❌ Помилка при оновленні повідомлення.", reply_markup=get_admin_bot_activity_menu())
+        
+        del user_states[chat_id]
+
+    else:
+        bot.send_message(chat_id, "Неочікуваний стан введення.", reply_markup=get_admin_bot_activity_menu())
+        if chat_id in user_states:
+            del user_states[chat_id]
+
+# --- Database Operations for Bot Activity ---
+
+def add_bot_target_location(location_name, location_id, location_type, invite_link, added_by):
+    """Adds a new bot target location to the database."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO bot_target_locations (location_name, location_id, location_type, invite_link, added_by)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (location_name, location_id, location_type, invite_link, added_by))
+                return True
+    except Exception as e:
+        logging.error(f"Error adding bot target location: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def get_bot_target_locations():
+    """Retrieves all bot target locations."""
+    conn = get_db_connection()
+    locations = []
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, location_name, location_id, location_type, invite_link FROM bot_target_locations ORDER BY created_at DESC;")
+                locations = cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error fetching bot target locations: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return locations
+
+def get_bot_target_location(location_id):
+    """Retrieves a single bot target location by ID."""
+    conn = get_db_connection()
+    location = None
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, location_name, location_id, location_type, invite_link FROM bot_target_locations WHERE id = %s;", (location_id,))
+                location = cur.fetchone()
+    except Exception as e:
+        logging.error(f"Error fetching bot target location {location_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return location
+
+def update_bot_target_location(db_id, location_name, location_id, location_type, invite_link):
+    """Updates an existing bot target location."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE bot_target_locations
+                    SET location_name = %s, location_id = %s, location_type = %s, invite_link = %s
+                    WHERE id = %s;
+                """, (location_name, location_id, location_type, invite_link, db_id))
+                return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Error updating bot target location {db_id}: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def delete_bot_target_location_db(location_id):
+    """Deletes a bot target location."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bot_target_locations WHERE id = %s;", (location_id,))
+                return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Error deleting bot target location {location_id}: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def add_bot_comment_template(name, message_text, subscription_link):
+    """Adds a new bot comment template to the database."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO bot_comment_templates (name, message_text, subscription_link)
+                    VALUES (%s, %s, %s);
+                """, (name, message_text, subscription_link))
+                return True
+    except Exception as e:
+        logging.error(f"Error adding bot comment template: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def get_bot_comment_templates():
+    """Retrieves all bot comment templates."""
+    conn = get_db_connection()
+    templates = []
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name, message_text, subscription_link FROM bot_comment_templates ORDER BY created_at DESC;")
+                templates = cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error fetching bot comment templates: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return templates
+
+def get_bot_comment_template(template_id):
+    """Retrieves a single bot comment template by ID."""
+    conn = get_db_connection()
+    template = None
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name, message_text, subscription_link FROM bot_comment_templates WHERE id = %s;", (template_id,))
+                template = cur.fetchone()
+    except Exception as e:
+        logging.error(f"Error fetching bot comment template {template_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return template
+
+def update_bot_comment_template(template_id, name, message_text, subscription_link):
+    """Updates an existing bot comment template."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE bot_comment_templates
+                    SET name = %s, message_text = %s, subscription_link = %s
+                    WHERE id = %s;
+                """, (name, message_text, subscription_link, template_id))
+                return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Error updating bot comment template {template_id}: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def delete_bot_comment_template_db(template_id):
+    """Deletes a bot comment template."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bot_comment_templates WHERE id = %s;", (template_id,))
+                return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Error deleting bot comment template {template_id}: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 # ============ MAIN FUNCTION ============
 
