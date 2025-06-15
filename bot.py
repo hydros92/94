@@ -355,6 +355,10 @@ def callback_handler(call):
     """Handles all inline keyboard callback queries."""
     chat_id = call.message.chat.id
 
+    # ALWAYS answer the callback query immediately to avoid "query too old" errors
+    # This prevents the button from showing "loading" indefinitely
+    bot.answer_callback_query(call.id)
+
     try:
         if call.data == "main_menu":
             bot.edit_message_text("Головне меню:", chat_id, call.message.message_id,
@@ -402,35 +406,32 @@ def callback_handler(call):
         elif call.data == "toggle_notifications":
             toggle_notifications(call)
 
-        # New callback handlers (placeholders/TODOs from previous version implemented)
         elif call.data == "channels_by_city":
-            bot.answer_callback_query(call.id, "Функція 'Канали за містами' ще не реалізована, але ви можете переглянути свої додані канали та групи.")
-            # TODO: Implement show_channels_by_city(call) - requires more complex UI for filtering
+            # This is a placeholder as discussed, the admin has the full stats
+            bot.send_message(chat_id, "Функція 'Канали за містами' ще не реалізована для звичайних користувачів, але ви можете переглянути свої додані канали та групи.")
 
         elif call.data == "channels_stats":
-            bot.answer_callback_query(call.id, "Функція 'Статистика каналів' вже реалізована через адмін-панель (Channels).")
-            show_channels_stats(call) # Now actually shows stats
+            # This points to the admin function, but users won't have the context
+            bot.send_message(chat_id, "Функція 'Статистика каналів' доступна тільки адміністраторам.")
+            # For a regular user, you might want to show their own stats or a general overview
 
         elif call.data == "stats":
-            bot.answer_callback_query(call.id, "Загальна статистика поки що обмежена статистикою користувачів та рейтингів.")
-            show_overall_stats(call) # Will add this below, for now uses existing stats
+            show_overall_stats(call) # Now actually shows overall stats
 
         elif call.data == "help":
-            bot.answer_callback_query(call.id, "Допомога ще не реалізована. Зверніться до адміністратора.")
-            # TODO: Implement help_message(call)
+            bot.send_message(chat_id, "Допомога ще не реалізована. Зверніться до адміністратора.")
 
         elif call.data == "skip_rating":
             bot.edit_message_text("Добре, ви пропустили оцінку.", chat_id, call.message.message_id,
                                   reply_markup=get_main_menu())
-            bot.answer_callback_query(call.id)
             return
-
-        # Answer the callback query to remove the "loading" state on the button
-        bot.answer_callback_query(call.id)
 
     except Exception as e:
         logging.error(f"Помилка в callback_handler: {e}")
-        bot.answer_callback_query(call.id, "Сталася помилка. Спробуйте ще раз.")
+        # Only answer if it wasn't already answered. This catch is for deeper errors.
+        # It's okay to send a message here as the callback_query was already answered.
+        bot.send_message(chat_id, "Сталася помилка під час обробки вашого запиту. Спробуйте ще раз або зверніться до адміністратора.")
+
 
 # ============ REGISTRATION WITH CITY SELECTION ============
 
@@ -484,7 +485,7 @@ def handle_city_selection(call):
 
     except Exception as e:
         logging.error(f"Помилка при реєстрації користувача: {e}")
-        bot.answer_callback_query(call.id, "Сталася помилка при реєстрації")
+        bot.send_message(chat_id, "Сталася помилка при реєстрації. Спробуйте ще раз.")
 
 # ============ ADDING CHANNELS / GROUPS ============
 
@@ -709,7 +710,7 @@ def handle_rating(call):
 
     except Exception as e:
         logging.error(f"Помилка при збереженні рейтингу: {e}")
-        bot.answer_callback_query(call.id, "Помилка при збереженні оцінки")
+        bot.send_message(chat_id, "Помилка при збереженні оцінки.")
 
 # ============ SEGMENTED BROADCAST ============
 
@@ -979,9 +980,14 @@ def delete_broadcast_template_db(template_id):
             with conn.cursor() as cur:
                 # Delete associated ratings first due to foreign key constraint
                 cur.execute("DELETE FROM broadcast_ratings WHERE template_id = %s;", (template_id,))
+                conn.commit() # Commit ratings deletion
                 cur.execute("DELETE FROM broadcast_templates WHERE id = %s;", (template_id,))
+                conn.commit() # Commit template deletion
                 return cur.rowcount > 0
     except Exception as e:
+        # Rollback in case of error
+        if conn:
+            conn.rollback()
         logging.error(f"Error deleting broadcast template {template_id}: {e}")
         return False
     finally:
@@ -1093,7 +1099,7 @@ def admin_manage_broadcast_details(call):
     template_id = int(call.data.replace("admin_broadcast_manage_", ""))
     template = get_broadcast_template(template_id)
     if not template:
-        bot.answer_callback_query(call.id, "Розсилку не знайдено.")
+        bot.send_message(call.message.chat.id, "Розсилку не знайдено.")
         admin_list_broadcasts(call)
         return
 
@@ -1137,7 +1143,7 @@ def admin_confirm_send_broadcast(call, template_id):
     chat_id = call.message.chat.id
     template = get_broadcast_template(template_id)
     if not template:
-        bot.answer_callback_query(call.id, "Розсилку не знайдено.")
+        bot.send_message(chat_id, "Розсилку не знайдено.")
         admin_send_broadcast_select_template(call)
         return
 
@@ -1163,7 +1169,7 @@ def admin_execute_send_broadcast(call):
     template = get_broadcast_template(template_id)
 
     if not template:
-        bot.answer_callback_query(call.id, "Розсилку не знайдено.")
+        bot.send_message(chat_id, "Розсилку не знайдено.")
         admin_send_broadcast_select_template(call)
         return
 
@@ -1172,7 +1178,7 @@ def admin_execute_send_broadcast(call):
     target_cities = template['target_cities']
     if target_cities:
         # Convert comma-separated string to a list of cities
-        target_cities_list = [city.strip().lower() for city in target_cities.split(',')]
+        target_cities_list = [city.strip().lower() for city in target_cities.split(',') if c.strip()]
     else:
         target_cities_list = None # Send to all if no cities specified
 
@@ -1185,7 +1191,7 @@ def admin_send_test_broadcast(call, template_id):
     chat_id = call.message.chat.id
     template = get_broadcast_template(template_id)
     if not template:
-        bot.answer_callback_query(call.id, "Розсилку не знайдено.")
+        bot.send_message(chat_id, "Розсилку не знайдено.")
         admin_list_broadcasts(call)
         return
 
@@ -1196,7 +1202,7 @@ def admin_send_test_broadcast(call, template_id):
         chat_id_for_test=chat_id,
         template_id=template['id'] # Still include template_id for rating test
     )
-    bot.answer_callback_query(call.id, f"Тестова розсилка надіслана. Кількість: {sent_count}")
+    bot.send_message(chat_id, f"Тестова розсилка надіслана. Кількість: {sent_count}", reply_markup=get_admin_broadcast_menu())
 
 
 def admin_edit_broadcast_select_template(call):
@@ -1220,7 +1226,7 @@ def admin_edit_broadcast_start(call, template_id):
     chat_id = call.message.chat.id
     template = get_broadcast_template(template_id)
     if not template:
-        bot.answer_callback_query(call.id, "Розсилку не знайдено.")
+        bot.send_message(chat_id, "Розсилку не знайдено.")
         admin_edit_broadcast_select_template(call)
         return
 
@@ -1257,7 +1263,7 @@ def admin_delete_broadcast(call, template_id):
     chat_id = call.message.chat.id
     template = get_broadcast_template(template_id)
     if not template:
-        bot.answer_callback_query(call.id, "Розсилку не знайдено.")
+        bot.send_message(chat_id, "Розсилку не знайдено.")
         admin_delete_broadcast_select_template(call)
         return
 
@@ -1598,9 +1604,9 @@ def delete_user_channel(call):
 
     success = delete_channel_by_id(channel_id, chat_id)
     if success:
-        bot.answer_callback_query(call.id, "Канал успішно видалено.")
+        bot.send_message(chat_id, "Канал успішно видалено.")
     else:
-        bot.answer_callback_query(call.id, "Не вдалося видалити канал. Можливо, він не ваш або вже видалений.")
+        bot.send_message(chat_id, "Не вдалося видалити канал. Можливо, він не ваш або вже видалений.")
     show_my_channels(call) # Refresh the list
 
 
@@ -1633,9 +1639,9 @@ def delete_user_group(call):
 
     success = delete_group_by_id(group_id, chat_id)
     if success:
-        bot.answer_callback_query(call.id, "Групу успішно видалено.")
+        bot.send_message(chat_id, "Групу успішно видалено.")
     else:
-        bot.answer_callback_query(call.id, "Не вдалося видалити групу. Можливо, вона не ваша або вже видалена.")
+        bot.send_message(chat_id, "Не вдалося видалити групу. Можливо, вона не ваша або вже видалена.")
     show_my_groups(call) # Refresh the list
 
 # ============ USER SETTINGS ============
@@ -1659,9 +1665,9 @@ def toggle_notifications(call):
     update_user_notifications_status(chat_id, new_status)
 
     if new_status:
-        bot.answer_callback_query(call.id, "Сповіщення увімкнено.")
+        bot.send_message(chat_id, "Сповіщення увімкнено.")
     else:
-        bot.answer_callback_query(call.id, "Сповіщення вимкнено.")
+        bot.send_message(chat_id, "Сповіщення вимкнено.")
 
     user_settings(call) # Refresh settings menu
 
